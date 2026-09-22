@@ -149,12 +149,37 @@ Maintainers must decide among three candidates:
 
 ## 8. Checkpoint Behavior
 
-- Define a **commit/flush boundary** that persists outstanding writes to the GeaFlow
-  store atomically (reuse engine checkpoint if available; otherwise a per-backend
-  flush marker).
+- Keep the durability terms distinct:
 
-- On restart, reload from the last completed checkpoint; any write after the last
-  checkpoint must be either re-applied idempotently or fail closed — never silently lost.
+  - **accepted**: a mutation has been validated and staged by the backend. It is not
+    restart-durable yet;
+
+  - **flush**: buffered state has been pushed to the configured store. A flush alone is
+    not a recoverable checkpoint and must not advance the durable watermark;
+
+  - **checkpoint/archive**: the engine has archived one version, identified by a
+    monotonically increasing `checkpointId`, from which state can be recovered; and
+
+  - **publish**: a small manifest (`checkpointId`, schema version, operation watermark,
+    record counts/checksums) has atomically become `lastCompletedCheckpoint`.
+
+- The minimal commit sequence is **apply staged mutations → flush → archive → publish
+  manifest → acknowledge checkpoint completion**. The backend must not report a
+  checkpoint as durable before the manifest is published. Prefer the engine's existing
+  checkpoint/archive path; a standalone marker around `flush()` is not equivalent and
+  is not sufficient.
+
+- On restart, load only the manifest named by `lastCompletedCheckpoint`, then recover
+  that archived version. An archive or manifest temporary file left by a crash before
+  publication is incomplete and must be ignored or quarantined. A published manifest
+  whose archive/checksum cannot be loaded is a hard, actionable startup failure.
+
+- Writes accepted after the last completed checkpoint are not claimed to survive a
+  process crash. They may be acknowledged as restart-durable only after checkpoint
+  completion. If a durable upstream operation log exists, replay the range after the
+  manifest's operation watermark using the idempotent rules in §9; otherwise expose
+  that range as uncommitted and fail closed rather than silently presenting it as
+  recovered data. This is restart consistency for the slice, not a production HA claim.
 
 - Expose the checkpoint/lag state so a later `SearchableWatermark` (Issue 857) can read it.
 
@@ -193,14 +218,42 @@ a minimum design is proposed here — as a decision, not a code sketch.
      drop-in for the fake backend. Documenting this choice now avoids a silent
      cross-process break later.
 
-3. **Write-path mapping.** No path exists from `MutableGraph` to a GeaFlow DSL/state
-   surface. Pick **table-based** for the slice (GQL-computable, introspection-friendly)
-   over raw state-store writes (faster but bypasses schema). This is Option B's bulk.
+3. **Write-path mapping and idempotent upsert.** No path exists from `MutableGraph` to a
+   GeaFlow DSL/state surface. Pick **table-based** for the slice (GQL-computable,
+   introspection-friendly) over raw state-store writes (faster but bypasses schema).
+   The `GraphBackend` contract must not equate the current append-style `addEdge` with
+   an upsert. It uses these replay rules:
 
-4. **Identity semantics.** `scanEdge(GraphVertex)` and `MemoryGraph` key on in-memory
-   objects; a GeaFlow-backed impl must define equal `id`/`label` semantics
-   (`getVertex(label,id)` as the canonical key) so the two backends stay
-   interchangeable in the same contract suite.
+   - `upsertVertex(VertexKey, value)` and `upsertEdge(EdgeKey, value)` insert a missing
+     key or replace the value for the same key;
+
+   - replaying the same key/value is a no-op, not a duplicate;
+
+   - conflicting mutations for one key are ordered by a persisted operation sequence,
+     not wall-clock time; the last sequence in the committed batch wins; and
+
+   - delete is idempotent: deleting an absent key succeeds without creating a tombstone
+     visible to readers. The implementation may retain an internal tombstone for replay.
+
+   An edge is accepted only when both endpoint vertices exist in the last completed
+   state or are staged in the same commit. Dangling edges fail validation before the
+   checkpoint is published. Self-loops are valid.
+
+4. **Identity semantics.** The canonical vertex identity is
+   `VertexKey(label, id)`. The current in-memory path does not rely on Java object
+   identity, but some traversal paths use only the vertex id; the adapter must preserve
+   the label as well so equal ids under different labels cannot collide.
+
+   The canonical edge identity is
+   `EdgeKey(label, sourceVertexKey, targetVertexKey, edgeId)`, where `edgeId` is a
+   stable caller/source-fact identifier. Parallel edges share label/endpoints but have
+   different `edgeId` values; replay of the same `edgeId` updates one logical edge.
+   The existing `Edge` type has no edge id, so its compatibility adapter may map it to
+   a reserved singleton id only when the schema guarantees at most one edge for that
+   `(label, source, target)` tuple. It must reject an ambiguous parallel-edge write with
+   an actionable error rather than inventing an unstable id. Adding the stable edge key
+   belongs to the additive `GraphBackend` SPI (Issue 847), not a breaking change to the
+   existing `GraphAccessor`/`MutableGraph` signatures.
 
 5. **Backend wiring / registration.** `GraphMemoryServer` does **not** discover
    backends through `GraphComputeEngine` — it collects `GraphAccessor` via
@@ -221,11 +274,19 @@ a minimum design is proposed here — as a decision, not a code sketch.
 
 - **Round-trip**: write → flush/checkpoint → new JVM instance → read back equal graph.
 
+- **Checkpoint crash matrix**: terminate after apply, flush, archive, and manifest
+  publication; recovery returns exactly the last published checkpoint, while a missing
+  or corrupt published archive fails closed.
+
 - **Failure injection**: truncated/partial write fails closed or is quarantined
   (aligns with Issue 846/848).
 
 - **Idempotent replay**: re-applying the same upserts yields one logical state
   (aligns with Issue 845).
+
+- **Identity cases**: same vertex id under two labels, duplicate replay, two parallel
+  edges with different stable edge ids, a self-loop, and rejection of a dangling edge
+  (aligns with Issue 850).
 
 - Run the suite locally via the existing local-run path (fast, no external services).
 
@@ -241,9 +302,29 @@ a minimum design is proposed here — as a decision, not a code sketch.
 
 ### Migration paths between approaches
 
-- **B → A (write path too risky)**: stop routing `MutableGraph` writes to GeaFlow; the
-  accessor keeps serving reads. No data migration needed — the GeaFlow store is
-  already materialized from the ingested graph, so reads stay valid.
+- **B → A (write path too risky)**: this is a controlled read-only cutover, not an
+  unconditional zero-data-movement rollback. Before switching:
+
+  1. stop accepting new mutations and either complete or abort the in-flight checkpoint;
+
+  2. verify that the last published manifest and archived store pass schema,
+     count/checksum, and representative `get/scan` checks;
+
+  3. compare the highest accepted operation watermark with the committed operation
+     watermark recorded in the completed checkpoint manifest. Replay any gap from the
+     durable operation log; if no such log exists, the cutover is blocked and the
+     backend fails closed;
+
+  4. confirm that Option A's accessor can read that exact store format and canonical
+     identity model. Only this same-store case is zero-copy. Otherwise export/import a
+     validated snapshot and compare its manifest before routing reads; and
+
+  5. switch backend selection atomically, retain the B store read-only for diagnosis,
+     and run the Option A contract smoke tests before declaring the rollback complete.
+
+  While A is active, mutation endpoints must reject writes explicitly or route them to
+  a separately declared durable source; they must never return success for discarded
+  writes. Reads remain valid only after all five preconditions pass.
 
 - **B → C (projection becomes the real need)**: add the projector job as a read-side
   producer; writes remain as-is. A/C can coexist because both read from the same store.
@@ -252,8 +333,9 @@ a minimum design is proposed here — as a decision, not a code sketch.
   store directly, with the projector re-run to refresh projections — a refresh, not a
   rewrite of the writer.
 
-- **Any → A**: A is the common floor; every option degrades to read-only without
-  touching the default `MemoryGraph` path.
+- **Any → A**: A is the architectural common floor, but degradation to it is permitted
+  only after the source option has produced a verified, identity-compatible snapshot
+  with no unreplayable operation gap. The default `MemoryGraph` path remains untouched.
 
 ## 12. Open Questions
 
@@ -272,9 +354,11 @@ to the shared contract suite (Issue 850) before any broader rollout.
 
 **Rollback trigger & plan**: if the write-path mapping (Blockers 3/5) proves unstable
 or over-scoped, revert to **A (read-only)** for the first landed slice and re-open B via
-the §11 `B → A` migration path (reads stay valid, no data move). The decision record is
-the record of why B was chosen and under what condition it degrades — so a later
-maintainer can reverse it without re-deriving the context.
+the guarded §11 `B → A` cutover. Zero-copy rollback is allowed only when the completed
+checkpoint, operation watermark, schema/identity model, and Option A reader are all
+compatible; otherwise a validated snapshot transfer is required, and an unreplayable
+write gap blocks rollback. The decision record captures why B was chosen and under
+what verified conditions it degrades, so a later maintainer need not re-derive them.
 
 **Decision inputs land first**: resolve §12 open questions (write target; embedded vs
 separate local job; `GraphComputeEngine` lifecycle ownership) **in this design phase**,
